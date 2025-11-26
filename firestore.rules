@@ -1,0 +1,126 @@
+/**
+ * This ruleset enforces a strict user-ownership model for the PulseTrack Pro application.
+ * All user data is private and can only be accessed by the authenticated owner.
+ *
+ * Core Philosophy:
+ * The security model is built around path-based ownership. Every piece of user-generated
+ * content is stored within a path that includes their unique user ID (`userId`).
+ * This ensures that access control can be determined simply by comparing the `userId` in
+ * the path with the authenticated user's ID (`request.auth.uid`).
+ *
+ * Data Structure:
+ * The data is organized hierarchically to enforce privacy and ownership:
+ * - /users/{userId}: Stores the primary profile for a user.
+ * - /users/{userId}/heart_rate_measurements/{measurementId}: A subcollection containing
+ *   all heart rate data recorded by that specific user.
+ *
+ * Key Security Decisions:
+ * - No Public Data: All collections and subcollections are private to the owner.
+ * - User Isolation: Users cannot read, write, or even know about the existence of
+ *   other users' data. Listing the top-level `/users` collection is forbidden.
+ * - Path-Based Security: Access is granted based on the document's path, which is
+ *   highly performant as it avoids extra database reads (`get()` calls) for authorization.
+ * - Relational Integrity: On creation, rules validate that internal ID fields (like `userId`
+ *   or `id`) match the ID in the document's path to ensure data consistency. These
+ *   linking fields are enforced as immutable on update.
+ */
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // ------------------------------------------------------------------------
+    // Helper Functions
+    // ------------------------------------------------------------------------
+
+    /**
+     * Checks if a user is authenticated.
+     */
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    /**
+     * Checks if the currently authenticated user's ID matches the provided userId.
+     */
+    function isOwner(userId) {
+      return isSignedIn() && request.auth.uid == userId;
+    }
+
+    /**
+     * Checks for ownership on an existing document. Used for update and delete.
+     * Denies requests that target non-existent documents.
+     */
+    function isExistingOwner(userId) {
+      return isOwner(userId) && resource != null;
+    }
+
+    /**
+     * On create, validates that the user document's internal `id` field
+     * matches the document ID from the path. This enforces relational consistency.
+     */
+    function hasValidUserProfileDataOnCreate(userId) {
+      return request.resource.data.id == userId;
+    }
+
+    /**
+     * On update, ensures the user document's internal `id` field is immutable.
+     * This prevents re-assigning the document to a different user.
+     */
+    function isUserProfileImmutable() {
+      return request.resource.data.id == resource.data.id;
+    }
+
+    /**
+     * On create, validates that the measurement's internal `userId` field
+     * matches the `userId` from the path, linking it correctly to its owner.
+     */
+    function hasValidHeartRateDataOnCreate(userId) {
+      return request.resource.data.userId == userId;
+    }
+
+    /**
+     * On update, ensures the measurement's `userId` field is immutable,
+     * preventing the measurement from being moved to another user's data tree.
+     */
+    function isHeartRateLinkImmutable() {
+      return request.resource.data.userId == resource.data.userId;
+    }
+
+
+    // ------------------------------------------------------------------------
+    // Collection Rules
+    // ------------------------------------------------------------------------
+
+    /**
+     * @description Manages user profile documents. A user can only access their own profile.
+     * @path        /users/{userId}
+     * @allow       (get, create, update, delete) An authenticated user with UID 'user_abc' accessing their own document at `/users/user_abc`.
+     * @deny        (get) An authenticated user 'user_xyz' trying to read `/users/user_abc`.
+     * @deny        (list) Any user trying to query the `/users` collection.
+     * @principle   Restricts access to a user's own data tree. Enforces self-creation and ownership.
+     */
+    match /users/{userId} {
+      allow get: if isOwner(userId);
+      allow list: if false;
+      allow create: if isOwner(userId) && hasValidUserProfileDataOnCreate(userId);
+      allow update: if isExistingOwner(userId) && isUserProfileImmutable();
+      allow delete: if isExistingOwner(userId);
+    }
+
+    /**
+     * @description Manages heart rate measurements, which are private to each user.
+     * @path        /users/{userId}/heart_rate_measurements/{measurementId}
+     * @allow       (list) An authenticated user 'user_abc' querying their own measurements at `/users/user_abc/heart_rate_measurements`.
+     * @allow       (create) An authenticated user 'user_abc' creating a new document at `/users/user_abc/heart_rate_measurements/new_measurement`.
+     * @deny        (get) An authenticated user 'user_xyz' trying to read a measurement at `/users/user_abc/heart_rate_measurements/some_measurement`.
+     * @principle   Enforces document ownership via path inheritance for all operations.
+     */
+    match /users/{userId}/heart_rate_measurements/{measurementId} {
+      allow get: if isOwner(userId);
+      allow list: if isOwner(userId);
+      allow create: if isOwner(userId) && hasValidHeartRateDataOnCreate(userId);
+      allow update: if isExistingOwner(userId) && isHeartRateLinkImmutable();
+      allow delete: if isExistingOwner(userId);
+    }
+  }
+}
